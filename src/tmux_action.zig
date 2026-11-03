@@ -216,7 +216,13 @@ pub fn translate(
         // A native window is a group of tmux windows (see `Context.tabs`)
         // and each native tab is one of them.
 
-        .new_tab => affinity(try newTab(alloc, ctx), .tab),
+        // The gateway is a local control terminal, not a tmux pane. A new
+        // tab there belongs to its native window, not the tmux window
+        // that happens to be active.
+        .new_tab => if (ctx.pane == null)
+            .native
+        else
+            affinity(try newTab(alloc, ctx), .tab),
         .new_window => affinity(try single(alloc, "new-window", .{}), .window),
 
         .close_tab => |mode| if (ctx.confirm_close)
@@ -609,9 +615,9 @@ fn closeTab(
 fn newTab(alloc: Allocator, ctx: Context) Allocator.Error!Result {
     var single_tab: [1]usize = undefined;
     const tabs = group(&ctx, &single_tab) orelse {
-        // The gateway shows no tmux window, so the place is tmux's: its
-        // current window, or its last one. The braces of `{end}` would
-        // start a command block if they weren't quoted.
+        // If the pane's window isn't known yet, use tmux's current
+        // window, or its last one. The braces of `{end}` would start a
+        // command block if they weren't quoted.
         return switch (ctx.new_tab_position) {
             .current => single(alloc, "new-window -a", .{}),
             .end => single(alloc, "new-window -a -t '{{end}}'", .{}),
@@ -801,11 +807,21 @@ test "new_tab and new_window record where the window goes" {
         try std.testing.expectEqual(Affinity.window, result.commands.affinity);
     }
 
-    // The gateway can create windows too. Its tab goes after tmux's
-    // current window, or after its last one.
-    try expectCommands("new-window -a\n", .new_tab, .{});
-    try expectCommands("new-window -a -t '{end}'\n", .new_tab, .{ .new_tab_position = .end });
+    // The gateway can explicitly create tmux windows too.
     try expectCommands("new-window\n", .new_window, .{});
+}
+
+test "new_tab on the gateway stays in its native window" {
+    try expectKind(.native, .new_tab, .{});
+    try expectKind(.native, .new_tab, .{ .new_tab_position = .end });
+}
+
+test "new_tab on a follower without a known window still creates a tmux window" {
+    try expectCommands("new-window -a\n", .new_tab, .{ .pane = 5 });
+    try expectCommands("new-window -a -t '{end}'\n", .new_tab, .{
+        .pane = 5,
+        .new_tab_position = .end,
+    });
 }
 
 test "new_tab goes where window-new-tab-position says" {
