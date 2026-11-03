@@ -140,10 +140,6 @@ pub const Message = union(enum) {
     /// its command queue.
     tmux_detaching: void,
 
-    /// tmux control mode follower: tmux sized our pane, so this becomes
-    /// the terminal grid from now on regardless of the surface size.
-    tmux_grid: renderer.GridSize,
-
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 

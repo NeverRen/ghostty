@@ -1413,6 +1413,10 @@ pub const Session = struct {
             if (self.grids.get(v.pane)) |last| {
                 if (last.columns == grid.columns and last.rows == grid.rows) continue;
             }
+            surface.io.tmuxQueueGrid(grid) catch |err| {
+                log.warn("failed to queue tmux pane grid err={}", .{err});
+                continue;
+            };
             self.grids.put(self.alloc, v.pane, grid) catch |err| {
                 log.warn("failed to track tmux pane grid err={}", .{err});
                 continue;
@@ -1420,7 +1424,6 @@ pub const Session = struct {
 
             log.debug("grid pane=%{d} {d}x{d}", .{ v.pane, grid.columns, grid.rows });
             surface.tmux_grid = grid;
-            surface.io.queueMessage(.{ .tmux_grid = grid }, .unlocked);
         }
     }
 

@@ -32,10 +32,11 @@ alloc: Allocator,
 /// The tmux pane id (the number in `%3`) this surface mirrors.
 pane_id: usize,
 
-/// Pane output the app thread handed us that the reader thread hasn't
-/// processed yet. See queueOutput. `quit` tells the reader thread to
-/// stop. All three are guarded by `output_mutex`.
-output: std.ArrayList(u8) = .empty,
+/// Pane output and grid changes in control-stream order. Both must be
+/// consumed by the same reader: sending grids to the IO thread lets a
+/// redraw overtake its resize, or a resize overtake older pane output.
+/// `quit` tells the reader to stop. Guarded by `output_mutex`.
+output: Output = .{},
 quit: bool = false,
 output_mutex: std.Io.Mutex = .init,
 output_cond: std.Io.Condition = .init,
@@ -61,7 +62,18 @@ pub fn deinit(self: *Tmux) void {
 pub fn queueOutput(self: *Tmux, data: []const u8) Allocator.Error!void {
     self.output_mutex.lockUncancelable(global.io());
     defer self.output_mutex.unlock(global.io());
-    try self.output.appendSlice(self.alloc, data);
+    try self.output.bytes.appendSlice(self.alloc, data);
+    self.output_cond.signal(global.io());
+}
+
+/// Queue a grid change at this exact position in the pane's output.
+pub fn queueGrid(self: *Tmux, grid: renderer.GridSize) Allocator.Error!void {
+    self.output_mutex.lockUncancelable(global.io());
+    defer self.output_mutex.unlock(global.io());
+    try self.output.grids.append(self.alloc, .{
+        .offset = self.output.bytes.items.len,
+        .size = grid,
+    });
     self.output_cond.signal(global.io());
 }
 
@@ -71,19 +83,45 @@ fn readerMain(self: *Tmux, io: *termio.Termio) void {
         var output = output: {
             self.output_mutex.lockUncancelable(global.io());
             defer self.output_mutex.unlock(global.io());
-            while (self.output.items.len == 0 and !self.quit) {
+            while (self.output.empty() and !self.quit) {
                 self.output_cond.waitUncancelable(global.io(), &self.output_mutex);
             }
             if (self.quit) return;
 
             const output = self.output;
-            self.output = .empty;
+            self.output = .{};
             break :output output;
         };
         defer output.deinit(self.alloc);
-        io.processOutput(output.items);
+        output.process(io) catch |err| {
+            log.warn("error applying tmux pane grid err={}", .{err});
+        };
     }
 }
+
+const Output = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    grids: std.ArrayList(struct { offset: usize, size: renderer.GridSize }) = .empty,
+
+    fn empty(self: *const Output) bool {
+        return self.bytes.items.len == 0 and self.grids.items.len == 0;
+    }
+
+    fn deinit(self: *Output, alloc: Allocator) void {
+        self.bytes.deinit(alloc);
+        self.grids.deinit(alloc);
+    }
+
+    fn process(self: *const Output, io: *termio.Termio) !void {
+        var offset: usize = 0;
+        for (self.grids.items) |grid| {
+            if (offset < grid.offset) io.processOutput(self.bytes.items[offset..grid.offset]);
+            try io.setGridOverride(grid.size);
+            offset = grid.offset;
+        }
+        if (offset < self.bytes.items.len) io.processOutput(self.bytes.items[offset..]);
+    }
+};
 
 pub fn initTerminal(self: *Tmux, term: *terminal.Terminal) void {
     _ = self;
@@ -205,3 +243,97 @@ pub const ThreadData = struct {
 pub const Config = struct {
     pane_id: usize,
 };
+
+test "tmux reader orders grid changes with old and new pane output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const configpkg = @import("../config.zig");
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var wakeup = try global.xev.Async.init();
+    defer wakeup.deinit();
+    const mailbox = try renderer.Thread.Mailbox.create(alloc);
+    defer mailbox.destroy(alloc);
+    var mutex: std.Io.Mutex = .init;
+    var io: termio.Termio = undefined;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
+    const pixels: renderer.Size = .{
+        .screen = .{ .width = 40, .height = 40 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+    const derived = try termio.Termio.DerivedConfig.init(alloc, &config);
+    io = .{
+        .alloc = alloc,
+        .terminal = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 4, .rows = 2 }),
+        .size = pixels,
+        .grid_override = .{ .columns = 4, .rows = 2 },
+        .config = derived,
+        .backend = .{ .tmux = .init(alloc, 0) },
+        .mailbox = try termio.Mailbox.initSPSC(alloc),
+        .renderer_state = &state,
+        .renderer_wakeup = wakeup,
+        .renderer_mailbox = mailbox,
+        // These sequences never send app messages; no GTK objects needed.
+        .surface_mailbox = undefined,
+        .terminal_stream = .init(.{
+            .allocator = alloc,
+            .handler = .{
+                .alloc = alloc,
+                .terminal = &io.terminal,
+                .size = &io.size,
+                .grid_override = &io.grid_override,
+                .termio_mailbox = &io.mailbox,
+                .surface_mailbox = undefined,
+                .renderer_state = &state,
+                .renderer_wakeup = wakeup,
+                .renderer_mailbox = mailbox,
+                .enquiry_response = derived.enquiry_response,
+                .osc_color_report_format = derived.osc_color_report_format,
+                .clipboard_write = derived.clipboard_write,
+                .clipboard_write_limit = derived.clipboard_write_limit,
+                .xt_checksum_report = derived.xt_checksum_report,
+                .tmux_follower = true,
+            },
+        }),
+    };
+    defer io.deinit();
+
+    // Leave the IO mailbox undrained, as when its thread is delayed.
+    // Native pixel resizes must not hold up a server grid or its redraw.
+    io.queueMessage(.{ .resize = pixels }, .unlocked);
+    io.tmuxQueueOutput("\x1b[?1049habcdefgh");
+    try io.tmuxQueueGrid(.{ .columns = 8, .rows = 4 });
+    io.tmuxQueueOutput("\x1b[4;8HZ");
+    const tmux = &io.backend.tmux;
+    try tmux.output.process(&io);
+    tmux.output.deinit(alloc);
+    tmux.output = .{};
+    {
+        // Old output wraps at four columns, new output addresses row 4,
+        // column 8. Neither direction may overtake the other.
+        const text = try io.terminal.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(text);
+        try testing.expectEqualStrings("abcd\nefgh\n\n       Z", text);
+        try testing.expectEqual(8, io.terminal.cols);
+        try testing.expectEqual(4, io.terminal.rows);
+        try testing.expect(io.mailbox.spsc.queue.pop(testing.io).? == .resize);
+    }
+
+    // A grid at the end of one reader batch still precedes output in the
+    // next. The resize itself must wake the reader even without output.
+    try io.tmuxQueueGrid(.{ .columns = 4, .rows = 2 });
+    try testing.expect(!tmux.output.empty());
+    try tmux.output.process(&io);
+    tmux.output.deinit(alloc);
+    tmux.output = .{};
+    try testing.expectEqual(4, io.terminal.cols);
+    try testing.expectEqual(2, io.terminal.rows);
+    io.tmuxQueueOutput("\x1b[2J\x1b[Hnew!\x1b[2;1Hdone");
+    try tmux.output.process(&io);
+    {
+        const text = try io.terminal.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+        defer alloc.free(text);
+        try testing.expectEqualStrings("new!\ndone", text);
+    }
+}

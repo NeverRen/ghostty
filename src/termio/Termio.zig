@@ -583,13 +583,15 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    self.size = size;
-    const grid_size = self.grid_override orelse size.grid();
-
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+
+        // The tmux reader changes grid_override and reads cell metrics
+        // under this lock, in order with the pane's output.
+        self.size = size;
+        const grid_size = self.grid_override orelse size.grid();
 
         // Resizing the pty can immediately wake the shell with SIGWINCH.
         // Hold the same lock used by processOutput before notifying it, so
@@ -608,17 +610,7 @@ pub fn resize(
         }
 
         // Update the size of our terminal state
-        try self.terminal.resize(
-            self.alloc,
-            .{
-                .cols = grid_size.columns,
-                .rows = grid_size.rows,
-                .cell_size_px = .{
-                    .width = self.size.cell.width,
-                    .height = self.size.cell.height,
-                },
-            },
-        );
+        try self.resizeTerminal(grid_size);
 
         // If we have size reporting enabled we need to send a report.
         if (self.terminal.modes.get(.in_band_size_reports)) {
@@ -631,24 +623,37 @@ pub fn resize(
     self.renderer_wakeup.notify() catch {};
 }
 
-/// Use `grid` as the terminal grid from now on, whatever the size of the
-/// surface. See `Options.grid_override`.
+/// Apply a grid on the follower reader, in order with pane output. The
+/// surface's pixel size is managed separately by the IO thread.
 pub fn setGridOverride(
     self: *Termio,
-    td: *ThreadData,
     grid: renderer.GridSize,
 ) !void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
     if (self.grid_override) |v| {
         if (v.columns == grid.columns and v.rows == grid.rows) return;
     }
 
-    // The stream handler reads it on the read thread.
-    {
-        self.renderer_state.mutex.lockUncancelable(global.io());
-        defer self.renderer_state.mutex.unlock(global.io());
-        self.grid_override = grid;
+    try self.resizeTerminal(grid);
+    self.grid_override = grid;
+    if (self.terminal.modes.get(.in_band_size_reports)) {
+        self.queueMessage(.{ .size_report = .mode_2048 }, .locked);
     }
-    try self.resize(td, self.size);
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// The renderer state mutex must be held.
+fn resizeTerminal(self: *Termio, grid: renderer.GridSize) !void {
+    try self.terminal.resize(self.alloc, .{
+        .cols = grid.columns,
+        .rows = grid.rows,
+        .cell_size_px = .{
+            .width = self.size.cell.width,
+            .height = self.size.cell.height,
+        },
+    });
 }
 
 /// Make a size report.
@@ -763,6 +768,14 @@ pub fn tmuxQueueOutput(self: *Termio, data: []const u8) void {
             log.warn("error queueing tmux pane output err={}", .{err});
         },
         else => {},
+    }
+}
+
+/// Keep a pane's grid change ordered with the output it describes.
+pub fn tmuxQueueGrid(self: *Termio, grid: renderer.GridSize) Allocator.Error!void {
+    switch (self.backend) {
+        .tmux => |*tmux| try tmux.queueGrid(grid),
+        else => unreachable,
     }
 }
 

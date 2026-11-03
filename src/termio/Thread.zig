@@ -367,7 +367,6 @@ fn drainMailbox(
             .tmux_logging_toggle => io.tmuxToggleLogging(),
             .tmux_force_quit => io.tmuxForceQuit(),
             .tmux_detaching => io.tmuxDetaching(),
-            .tmux_grid => |v| try io.setGridOverride(data, v),
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),
