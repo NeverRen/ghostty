@@ -94,6 +94,12 @@ pub const StreamHandler = struct {
     /// The protocol line we're accumulating for logging.
     tmux_log_line: std.ArrayList(u8) = .empty,
 
+    /// Commands emitted on the read thread but not yet written by the IO
+    /// thread. IO-thread submissions flush these first so new input never
+    /// overtakes a command whose tmux_write wakeup is still in the mailbox.
+    /// Guarded by the renderer state mutex.
+    tmux_writes: std.ArrayList(u8) = .empty,
+
     /// True once the control plate force-quit the session. tmux keeps
     /// talking to us but we no longer listen.
     tmux_abandoned: bool = false,
@@ -138,6 +144,7 @@ pub const StreamHandler = struct {
             self.tmux_control_mode.store(false, .release);
             self.tmux_logging.store(false, .release);
             self.tmux_log_line.deinit(self.alloc);
+            self.tmux_writes.deinit(self.alloc);
             const viewer = self.tmux_viewer orelse break :tmux;
             viewer.deinit();
             self.alloc.destroy(viewer);
@@ -600,10 +607,9 @@ pub const StreamHandler = struct {
                 assert(command.len > 0);
                 assert(command[command.len - 1] == '\n');
                 if (self.tmux_logging.load(.acquire)) self.tmuxLogOut(command);
-                self.messageWriter(.{ .tmux_write = .{
-                    .alloc = self.alloc,
-                    .data = try self.alloc.dupe(u8, command),
-                } });
+                const notify = self.tmux_writes.items.len == 0;
+                try self.tmux_writes.appendSlice(self.alloc, command);
+                if (notify) self.messageWriter(.tmux_write);
             },
 
             .pane_restore => |v| self.tmuxForwardRestore(v),
@@ -783,6 +789,7 @@ pub const StreamHandler = struct {
 
     /// Tear down our control mode state and let the GUI know.
     fn tmuxExit(self: *StreamHandler) void {
+        self.tmux_writes.clearRetainingCapacity();
         self.tmux_control_mode.store(false, .release);
         self.tmux_logging.store(false, .release);
         self.tmux_log_line.clearAndFree(self.alloc);
@@ -859,18 +866,27 @@ pub const StreamHandler = struct {
     /// The renderer state mutex must be held.
     pub fn tmuxSubmitCommand(
         self: *StreamHandler,
-        command: []const u8,
+        request: union(enum) {
+            command: []const u8,
+            input: struct { pane_id: ?usize, data: []const u8 },
+        },
     ) ?[]const u8 {
         if (comptime !tmux_enabled) return null;
 
         const viewer = self.tmux_viewer orelse return null;
-        if (command.len == 0 or command[command.len - 1] != '\n') {
-            log.warn("ignoring tmux command without a trailing newline", .{});
-            return null;
-        }
+        const actions = switch (request) {
+            .command => |command| command: {
+                if (command.len == 0 or command[command.len - 1] != '\n') {
+                    log.warn("ignoring tmux command without a trailing newline", .{});
+                    return null;
+                }
+                break :command viewer.sendCommand(command);
+            },
+            .input => |input| viewer.sendInput(input.pane_id, input.data),
+        };
 
         var result: ?[]const u8 = null;
-        for (viewer.sendCommand(command)) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .command => |sent| {
                 if (self.tmux_logging.load(.acquire)) self.tmuxLogOut(sent);
                 result = sent;
@@ -920,6 +936,7 @@ pub const StreamHandler = struct {
     /// The renderer state mutex must be held.
     pub fn tmuxDetaching(self: *StreamHandler) void {
         if (comptime !tmux_enabled) return;
+        self.tmux_writes.clearRetainingCapacity();
         const viewer = self.tmux_viewer orelse return;
         viewer.detach();
     }

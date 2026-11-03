@@ -94,11 +94,13 @@ pub const Message = union(enum) {
     /// The data must include its trailing newline.
     tmux_command: WriteReq.Alloc,
 
-    /// tmux control mode: a command the viewer sends on its own, such as
-    /// the next one of its queue. Unlike a plain write it is dropped once
-    /// we're detaching: tmux still runs what it reads after
-    /// `detach-client`.
-    tmux_write: WriteReq.Alloc,
+    /// Terminal input eligible for pipelined send-keys commands. The
+    /// first eight bytes are the little-endian pane ID, followed by input.
+    tmux_input: WriteReq.Alloc,
+
+    /// Flush the viewer's pending writes in emission order. The bytes
+    /// live in the stream handler, guarded by the renderer state mutex.
+    tmux_write: void,
 
     /// tmux control mode: write bytes to the gateway pty as they are,
     /// past the viewer's command queue and past the `send-keys` wrapping
@@ -170,7 +172,7 @@ pub const Message = union(enum) {
             },
             .write_alloc,
             .tmux_command,
-            .tmux_write,
+            .tmux_input,
             .tmux_raw,
             .tmux_echo,
             => |v| v.alloc.free(v.data),

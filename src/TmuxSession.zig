@@ -14,12 +14,12 @@
 //!
 //! The gateway's stream handler runs the viewer (`terminal.tmux.Viewer`)
 //! on the pty read thread. The viewer parses notifications, owns a
-//! strictly sequential command queue and matches tmux's replies to
-//! commands by position. Its actions reach the gateway surface as surface
+//! command queue with pipelined terminal input and matches replies by
+//! position. Its actions reach the gateway surface as surface
 //! messages, which call into this session on the app thread. Every command
-//! goes through that queue (`sendCommand`). Only detach and force-quit
-//! write past it (`sendRaw`), because by then the viewer no longer sends
-//! commands.
+//! goes through that queue (`sendCommand` or `sendKeys`). Only detach and
+//! force-quit write past it (`sendRaw`), because by then the viewer no
+//! longer sends commands.
 //!
 //! Where the apprt can create a surface for a given pane (`native_layout`,
 //! true when its surface has `tmuxPane`),
@@ -448,27 +448,20 @@ pub const Session = struct {
         } }, .unlocked);
     }
 
-    /// Send raw terminal bytes to a pane as tmux keys. If `pane_id` is
-    /// null the session's active pane is targeted. See
-    /// `terminal.tmux.writeSendKeys` for the encoding.
-    pub fn sendKeys(self: *Session, pane_id: ?usize, data: []const u8) void {
-        var stack_buf: [512]u8 = undefined;
-        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.alloc);
-        var buf: std.Io.Writer.Allocating = .init(stack.allocator());
-        defer buf.deinit();
-
-        var rest = data;
-        while (rest.len > 0) {
-            const chunk = rest[0..@min(rest.len, terminal.tmux.send_keys_max)];
-            rest = rest[chunk.len..];
-
-            buf.clearRetainingCapacity();
-            terminal.tmux.writeSendKeys(&buf.writer, pane_id, chunk) catch {
-                log.warn("failed to encode tmux send-keys", .{});
-                return;
-            };
-            self.sendCommand(buf.writer.buffered());
-        }
+    /// Send terminal bytes through the input pipeline. The gateway IO
+    /// thread encodes them as send-keys commands and tracks their replies.
+    pub fn sendKeys(self: *Session, pane_id: usize, data: []const u8) void {
+        if (data.len == 0) return;
+        const owned = self.alloc.alloc(u8, @sizeOf(u64) + data.len) catch |err| {
+            log.warn("failed to allocate tmux input err={}", .{err});
+            return;
+        };
+        std.mem.writeInt(u64, owned[0..8], pane_id, .little);
+        @memcpy(owned[8..], data);
+        self.leader.io.queueMessage(.{ .tmux_input = .{
+            .alloc = self.alloc,
+            .data = owned,
+        } }, .unlocked);
     }
 
     /// Tell tmux that the view of a pane changed size.

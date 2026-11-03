@@ -483,7 +483,7 @@ pub fn queueInput(
     data: []const u8,
     linefeed: bool,
 ) !void {
-    if (self.inTmuxControlMode()) return try self.tmuxSendKeys(td, data);
+    if (self.inTmuxControlMode()) return try self.tmuxSendKeys(td, null, data);
     try self.queueWrite(td, data, linefeed);
 }
 
@@ -499,25 +499,23 @@ fn queueReport(self: *Termio, td: *ThreadData, data: []const u8) !void {
     try self.queueWrite(td, data, false);
 }
 
-/// Type `data` into tmux's active pane through the viewer's command
-/// queue, so tmux's replies stay matched to the commands that caused
-/// them. Long input is split into several `send-keys` commands.
-fn tmuxSendKeys(self: *Termio, td: *ThreadData, data: []const u8) !void {
+/// Send terminal input through the viewer's bounded input pipeline.
+/// Long input is split into several send-keys commands; each command
+/// remains tracked until its reply arrives.
+pub fn tmuxSendKeys(self: *Termio, td: *ThreadData, pane_id: ?usize, data: []const u8) !void {
     if (comptime !StreamHandler.tmux_enabled) return;
-
-    var stack_buf: [512]u8 = undefined;
-    var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.alloc);
-    var buf: std.Io.Writer.Allocating = .init(stack.allocator());
-    defer buf.deinit();
 
     var rest = data;
     while (rest.len > 0) {
         const chunk = rest[0..@min(rest.len, terminalpkg.tmux.send_keys_max)];
         rest = rest[chunk.len..];
-
-        buf.clearRetainingCapacity();
-        try terminalpkg.tmux.writeSendKeys(&buf.writer, null, chunk);
-        self.tmuxCommand(td, buf.writer.buffered());
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.tmuxFlushWrites(td);
+        const command = self.terminal_stream.handler.tmuxSubmitCommand(.{
+            .input = .{ .pane_id = pane_id, .data = chunk },
+        }) orelse continue;
+        try self.queueWrite(td, command, false);
     }
 }
 
@@ -715,22 +713,30 @@ pub fn tmuxCommand(self: *Termio, td: *ThreadData, command: []const u8) void {
 
     // The viewer queued the command behind one that is still in flight;
     // it'll be sent for us when its turn comes.
-    const data = self.terminal_stream.handler.tmuxSubmitCommand(command) orelse return;
+    self.tmuxFlushWrites(td);
+    const data = self.terminal_stream.handler.tmuxSubmitCommand(.{ .command = command }) orelse return;
     self.queueWrite(td, data, false) catch |err| {
         log.warn("error writing tmux command err={}", .{err});
     };
 }
 
-/// Write a command the tmux viewer sends on its own, unless we're
-/// detaching. See `termio.Message.tmux_write`.
-pub fn tmuxWrite(self: *Termio, td: *ThreadData, data: []const u8) void {
+/// Flush commands emitted by the reader. See termio.Message.tmux_write.
+pub fn tmuxWrite(self: *Termio, td: *ThreadData) void {
     if (comptime !StreamHandler.tmux_enabled) return;
 
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
+    self.tmuxFlushWrites(td);
+}
 
-    if (!self.terminal_stream.handler.tmuxSending()) return;
-    self.queueWrite(td, data, false) catch |err| {
+/// The renderer state mutex must be held. Flush before any direct write
+/// from the IO thread: a tmux_write wakeup can be behind newer input in
+/// the mailbox even though its commands were emitted first.
+fn tmuxFlushWrites(self: *Termio, td: *ThreadData) void {
+    const handler = &self.terminal_stream.handler;
+    defer handler.tmux_writes.clearRetainingCapacity();
+    if (!handler.tmuxSending() or handler.tmux_writes.items.len == 0) return;
+    self.queueWrite(td, handler.tmux_writes.items, false) catch |err| {
         log.warn("error writing tmux command err={}", .{err});
     };
 }
@@ -755,6 +761,7 @@ pub fn tmuxCapturePane(self: *Termio, td: *ThreadData, pane_id: usize) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
+    self.tmuxFlushWrites(td);
     const data = self.terminal_stream.handler.tmuxCapturePane(pane_id) orelse return;
     self.queueWrite(td, data, false) catch |err| {
         log.warn("error writing tmux capture-pane err={}", .{err});
@@ -769,6 +776,7 @@ pub fn tmuxRefreshWindows(self: *Termio, td: *ThreadData) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
+    self.tmuxFlushWrites(td);
     const data = self.terminal_stream.handler.tmuxRefreshWindows() orelse return;
     self.queueWrite(td, data, false) catch |err| {
         log.warn("error writing tmux list-windows err={}", .{err});

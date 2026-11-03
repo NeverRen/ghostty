@@ -347,10 +347,12 @@ fn drainMailbox(
                 defer v.alloc.free(v.data);
                 io.tmuxCommand(data, v.data);
             },
-            .tmux_write => |v| {
+            .tmux_input => |v| {
                 defer v.alloc.free(v.data);
-                io.tmuxWrite(data, v.data);
+                const pane_id = std.mem.readInt(u64, v.data[0..8], .little);
+                try io.tmuxSendKeys(data, @intCast(pane_id), v.data[8..]);
             },
+            .tmux_write => io.tmuxWrite(data),
             .tmux_raw => |v| {
                 defer v.alloc.free(v.data);
                 try io.queueWrite(data, v.data, false);

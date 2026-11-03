@@ -154,8 +154,8 @@ const COMMAND_QUEUE_INITIAL = 8;
 /// When `%session-changed` is received during `command_queue` state, the
 /// viewer resets itself completely: clears all windows/panes, emits an
 /// empty windows action, and restarts the `list_windows` flow for the new
-/// session. A command that is already in flight keeps its place at the
-/// head of the queue so its reply isn't taken for the new list.
+/// session. Commands already in flight keep their places at the head
+/// of the queue so their replies aren't taken for the new list.
 ///
 /// ## Reply Attribution
 ///
@@ -183,10 +183,12 @@ pub const Viewer = struct {
     /// versions as necessary.
     tmux_version: []const u8,
 
-    /// The list of commands we've sent that we want to send and wait
-    /// for a response for. We only send one command at a time just
-    /// to avoid any possible confusion around ordering.
+    /// Commands awaiting replies followed by commands waiting to be sent.
+    /// Input commands can be pipelined; all other commands are barriers.
     command_queue: CommandQueue,
+
+    /// The prefix of `command_queue` already emitted to the transport.
+    command_in_flight: usize = 0,
 
     /// The windows in the current session.
     windows: std.ArrayList(Window),
@@ -218,6 +220,10 @@ pub const Viewer = struct {
 
     /// Numbers the end markers of user commands. See `Command.User`.
     user_command_id: u32 = 0,
+
+    /// Bound the input pipeline without adding a round trip per key or
+    /// scroll event. Replies replenish slots in the pipeline.
+    const input_pipeline_limit = 64;
 
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
@@ -488,6 +494,28 @@ pub const Viewer = struct {
     /// The returned actions must be processed the same way as those from
     /// `next`, and are only valid until the next call into the viewer.
     pub fn sendCommand(self: *Viewer, command: []const u8) []const Action {
+        return self.sendUserCommand(command, false);
+    }
+
+    /// Send terminal input without waiting for each preceding input's
+    /// reply. Only commands encoded here may enter the input pipeline;
+    /// arbitrary user commands can change the session or run asynchronously.
+    pub fn sendInput(self: *Viewer, pane_id: ?usize, data: []const u8) []const Action {
+        if (data.len == 0) return &.{};
+        assert(data.len <= control.send_keys_max);
+
+        var stack_buf: [512]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.alloc);
+        var builder: std.Io.Writer.Allocating = .init(stack.allocator());
+        defer builder.deinit();
+        control.writeSendKeys(&builder.writer, pane_id, data) catch {
+            log.warn("failed to encode tmux input, dropping", .{});
+            return &.{};
+        };
+        return self.sendUserCommand(builder.writer.buffered(), true);
+    }
+
+    fn sendUserCommand(self: *Viewer, command: []const u8, pipeline: bool) []const Action {
         assert(command.len > 0);
         assert(command[command.len - 1] == '\n');
 
@@ -509,10 +537,17 @@ pub const Viewer = struct {
             return &.{};
         };
 
-        // If nothing is in flight we have to send this ourselves,
-        // otherwise the queue will send it when its turn comes.
-        const send = self.command_queue.empty();
-        self.queueCommands(&.{.{ .user = .{ .line = owned, .id = id } }}) catch {
+        // New input may join a pipeline, but cannot overtake a queued
+        // control command or a query whose reply is still outstanding.
+        const send = self.command_queue.empty() or
+            (pipeline and self.command_in_flight < input_pipeline_limit and
+                self.command_in_flight == self.command_queue.len() and
+                self.command_queue.first().?.isInput());
+        self.queueCommands(&.{.{ .user = .{
+            .line = owned,
+            .id = id,
+            .pipeline = pipeline,
+        } }}) catch {
             log.warn("failed to queue command, dropping", .{});
             self.alloc.free(owned);
             return &.{};
@@ -520,7 +555,9 @@ pub const Viewer = struct {
 
         // The queue owns `owned` until the matching block arrives, so
         // this stays valid for as long as the action is.
-        return if (send) self.singleAction(.{ .command = owned }) else &.{};
+        if (!send) return &.{};
+        self.command_in_flight += 1;
+        return self.singleAction(.{ .command = owned });
     }
 
     /// The name of the subscription that `windows_subscription_command`
@@ -563,6 +600,7 @@ pub const Viewer = struct {
             return &.{};
         };
         if (!send) return &.{};
+        self.command_in_flight = 1;
         return self.singleAction(.{ .command = builder.writer.buffered() });
     }
 
@@ -611,6 +649,7 @@ pub const Viewer = struct {
             return &.{};
         };
 
+        self.command_in_flight = 1;
         return self.singleAction(.{ .command = builder.writer.buffered() });
     }
 
@@ -727,11 +766,6 @@ pub const Viewer = struct {
         // Setup our empty actions list that commands can populate.
         var actions: std.ArrayList(Action) = .empty;
 
-        // Track whether the in-flight command slot is available. Starts true
-        // if queue is empty (no command in flight). Set to true when a command
-        // completes (block_end/block_err) or the queue is reset (session_changed).
-        var command_consumed = self.command_queue.empty();
-
         switch (n) {
             .enter => unreachable,
             .exit => return self.defunct(),
@@ -745,7 +779,7 @@ pub const Viewer = struct {
                 // the wrong command.
                 log.debug("ignoring tmux block we didn't send data={s}", .{block.data});
             } else {
-                const finished = self.receivedCommandOutput(
+                _ = self.receivedCommandOutput(
                     &actions,
                     block,
                     tag == .block_err,
@@ -753,10 +787,6 @@ pub const Viewer = struct {
                     log.warn("failed to process command output, becoming defunct", .{});
                     return self.defunct();
                 };
-
-                // The in-flight command is done unless it's a user
-                // command still waiting for its end marker.
-                if (finished) command_consumed = true;
             },
 
             .output => |out| self.receivedOutput(
@@ -773,17 +803,13 @@ pub const Viewer = struct {
             // We need to reset our state and start fresh with list-windows.
             // This completely replaces the viewer, so treat it like a fresh start.
             .session_changed => |info| {
-                const idle = self.sessionChanged(
+                self.sessionChanged(
                     &actions,
                     info.id,
                 ) catch {
                     log.warn("failed to handle session change, becoming defunct", .{});
                     return self.defunct();
                 };
-
-                // The queue was rebuilt. If a command was in flight it
-                // still is, and the next one goes out after its reply.
-                command_consumed = idle;
             },
 
             // Layout changed of a single window.
@@ -899,31 +925,14 @@ pub const Viewer = struct {
             => {},
         }
 
-        // After processing commands, we add our next command to
-        // execute if we have one. We do this last because command
-        // processing may itself queue more commands. We only emit a
-        // command if a prior command was consumed (or never existed).
-        if (self.state == .command_queue and command_consumed) {
-            if (self.command_queue.first()) |next_command| {
-                // We should not have any commands, because our nextCommand
-                // always queues them.
-                if (comptime std.debug.runtime_safety) {
-                    for (actions.items) |action| {
-                        if (action == .command) assert(false);
-                    }
-                }
-
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                const arena_alloc = arena.allocator();
-
-                var builder: std.Io.Writer.Allocating = .init(arena_alloc);
-                next_command.formatCommand(&builder.writer) catch
-                    return self.defunct();
-                actions.append(
-                    arena_alloc,
-                    .{ .command = builder.writer.buffered() },
-                ) catch return self.defunct();
+        // Refill the input pipeline, or send the next control command
+        // once all preceding replies have arrived.
+        if (self.state == .command_queue) {
+            var arena = self.action_arena.promote(self.alloc);
+            defer self.action_arena = arena.state;
+            const arena_alloc = arena.allocator();
+            if (self.sendQueuedCommands(arena_alloc) catch return self.defunct()) |action| {
+                actions.append(arena_alloc, action) catch return self.defunct();
             }
         }
 
@@ -1166,13 +1175,13 @@ pub const Viewer = struct {
     /// To do this, we emit an empty windows event (so callers can clear all
     /// windows), reset ourself, and start all over.
     ///
-    /// Returns true if no command is in flight, i.e. the first command of
-    /// the new queue has to be sent now.
+    /// Preserve the in-flight prefix before queuing the new session's
+    /// first query, so outstanding replies keep their original owners.
     fn sessionChanged(
         self: *Viewer,
         actions: *std.ArrayList(Action),
         session_id: usize,
-    ) (Allocator.Error || std.Io.Writer.Error)!bool {
+    ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
         var replacement: Viewer = try .init(self.io, self.alloc);
         errdefer replacement.deinit();
@@ -1185,49 +1194,41 @@ pub const Viewer = struct {
         var arena = replacement.action_arena.promote(replacement.alloc);
         const arena_alloc = arena.allocator();
         try actions.append(arena_alloc, .{ .windows = &.{} });
+        replacement.action_arena = arena.state;
 
-        // Carry over the commands that still matter:
-        //
-        // - The head of the queue, if any, was already sent. Its reply is
-        //   still coming and has to be matched against it, not against
-        //   the list-windows below. If it's one of ours it was about the
-        //   old session, so its reply is dropped.
-        // - User commands asked for something explicit and address panes
-        //   and windows by id, so they still go out (and a user command
-        //   can be what switched the session, with its end marker still
-        //   to come).
-        // - Our own captures and queries were for the old session's
-        //   panes and are dropped.
-        const idle = self.command_queue.empty();
+        // Preserve every command already emitted, including the entire
+        // input pipeline. Its replies must precede the new list-windows.
+        // Unsent user commands follow the refresh; unsent captures for
+        // the previous session are discarded.
         try replacement.command_queue.ensureUnusedCapacity(
             replacement.alloc,
             self.command_queue.len() + 1,
         );
+        replacement.tmux_version = try replacement.alloc.dupe(u8, self.tmux_version);
         {
             var it = self.command_queue.iterator(.forward);
-            var head = true;
-            while (it.next()) |command| {
-                defer head = false;
+            var index: usize = 0;
+            while (it.next()) |command| : (index += 1) {
+                if (index == self.command_in_flight) {
+                    replacement.command_queue.appendAssumeCapacity(.list_windows);
+                }
                 switch (command.*) {
                     // Ownership moves to the replacement.
                     .user => {
                         replacement.command_queue.appendAssumeCapacity(command.*);
                         command.* = .stale;
                     },
-
-                    else => if (head) {
+                    else => if (index < self.command_in_flight) {
                         replacement.command_queue.appendAssumeCapacity(.stale);
                     },
                 }
-
-                if (head) replacement.command_queue.appendAssumeCapacity(.list_windows);
             }
         }
-        if (idle) replacement.command_queue.appendAssumeCapacity(.list_windows);
+        if (self.command_in_flight == self.command_queue.len()) {
+            replacement.command_queue.appendAssumeCapacity(.list_windows);
+        }
         replacement.state = .command_queue;
-
-        // Transfer preserved state to replacement
-        replacement.tmux_version = try replacement.alloc.dupe(u8, self.tmux_version);
+        replacement.command_in_flight = self.command_in_flight;
         replacement.user_command_id = self.user_command_id;
 
         // Save arena state back before swap
@@ -1242,7 +1243,6 @@ pub const Viewer = struct {
         self.session_id = session_id;
 
         assert(self.state == .command_queue);
-        return idle;
     }
 
     /// Handle a block that answers the command at the head of the queue.
@@ -1284,6 +1284,8 @@ pub const Viewer = struct {
             ),
         };
         self.command_queue.deleteOldest(1);
+        assert(self.command_in_flight > 0);
+        self.command_in_flight -= 1;
         defer command.deinit(self.alloc);
 
         // A failed command has tmux's error message where its output
@@ -2044,8 +2046,34 @@ pub const Viewer = struct {
 
         // Move into the command queue state
         self.state = .command_queue;
+        self.command_in_flight = 1;
 
         return self.singleAction(action);
+    }
+
+    /// Emit unsent input up to the pipeline limit. Queries and arbitrary
+    /// user commands wait for all preceding replies and run alone.
+    fn sendQueuedCommands(self: *Viewer, alloc: Allocator) !?Action {
+        assert(self.command_in_flight <= self.command_queue.len());
+        if (self.command_queue.empty()) return null;
+        if (self.command_in_flight > 0 and
+            !self.command_queue.first().?.isInput()) return null;
+
+        var it = self.command_queue.iterator(.forward);
+        it.seekBy(@intCast(self.command_in_flight));
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        var count: usize = 0;
+        while (it.next()) |command| {
+            const in_flight = self.command_in_flight + count;
+            if (in_flight >= input_pipeline_limit) break;
+            if (!command.isInput() and in_flight > 0) break;
+            try command.formatCommand(&builder.writer);
+            count += 1;
+            if (!command.isInput()) break;
+        }
+        if (count == 0) return null;
+        self.command_in_flight += count;
+        return .{ .command = builder.writer.buffered() };
     }
 
     /// Queue multiple commands to execute. This doesn't add anything
@@ -2067,11 +2095,11 @@ pub const Viewer = struct {
 
     /// Queue a `list-windows`, unless one is already waiting to be sent:
     /// tmux runs that one after whatever made us ask, so its reply covers
-    /// it. One that is in flight (the head of the queue) may have run
+    /// it. One that is in flight may have run
     /// before, so it doesn't count.
     fn queueListWindows(self: *Viewer) Allocator.Error!void {
         var it = self.command_queue.iterator(.forward);
-        _ = it.next();
+        it.seekBy(@intCast(self.command_in_flight));
         while (it.next()) |command| {
             if (command.* == .list_windows) return;
         }
@@ -2111,10 +2139,9 @@ const State = enum {
     /// in the order provided in the `command_queue` field. This field
     /// isn't part of the state because it can be queued at any state.
     ///
-    /// Precondition: if self.command_queue.len > 0, then the first
-    /// command in the queue has already been sent to tmux (via a
-    /// `command` Action). The next output is assumed to be the result
-    /// of this command.
+    /// The first `command_in_flight` commands have been emitted to the
+    /// transport (via `command` Actions). Replies consume this prefix
+    /// in order; input commands can have several replies outstanding.
     ///
     /// To satisfy the above, any transitions INTO this state should
     /// send a command Action for the first command in the queue.
@@ -2174,6 +2201,9 @@ const Command = union(enum) {
         /// marker can't end the wrong command.
         id: u32,
 
+        /// True only for terminal input encoded by `sendInput`.
+        pipeline: bool = false,
+
         /// The marker command, to be formatted with the id. It prints the
         /// marker text and has no other effect.
         const marker_command = "display-message -p '" ++ marker_text ++ "'\n";
@@ -2190,6 +2220,13 @@ const Command = union(enum) {
             return std.mem.eql(u8, std.mem.trim(u8, data, " \r\n"), marker);
         }
     };
+
+    fn isInput(self: Command) bool {
+        return switch (self) {
+            .user => |v| v.pipeline,
+            else => false,
+        };
+    }
 
     pub fn deinit(self: Command, alloc: Allocator) void {
         return switch (self) {
@@ -4538,4 +4575,163 @@ test "replay of a real tmux control session" {
     try testing.expect(renamed);
     try testing.expectEqualStrings("editor", viewer.windows.items[1].name);
     try testing.expectEqualStrings("list-windows\n", commands.items);
+}
+
+test "tmux input pipeline sends without waiting and matches replies" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    // All inputs go out before any replies, including mouse reports and
+    // bytes that must be encoded literally rather than as tmux syntax.
+    for ([_][]const u8{ "\x1b[B", "\x1b[<65;10;10M", "a;\n'b" }) |data| {
+        const command = testCommand(viewer.sendInput(0, data)).?;
+        try testing.expect(std.mem.startsWith(u8, command, "send-keys -t %0 -H"));
+    }
+    try testing.expectEqual(3, viewer.command_in_flight);
+
+    var buf: [64]u8 = undefined;
+    for (0..3) |i| {
+        // Hook output, even one echoing our marker, isn't a reply.
+        try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = .{
+            .data = testMarker(&buf, @intCast(i)),
+            .client = false,
+        } } }).len);
+        // A failed send-keys must still wait for its own end marker.
+        try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_err = .{
+            .data = "can't find pane",
+        } } }).len);
+        try testing.expectEqual(3 - i, viewer.command_in_flight);
+        try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = .{
+            .data = testMarker(&buf, @intCast(i)),
+        } } }).len);
+        try testing.expectEqual(2 - i, viewer.command_in_flight);
+    }
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "tmux input pipeline is bounded and refills without resending" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    const limit = Viewer.input_pipeline_limit;
+    const total = limit + 3;
+    for (0..total) |i| {
+        const actions = viewer.sendInput(0, "x");
+        try testing.expectEqual(i < limit, testCommand(actions) != null);
+    }
+    try testing.expectEqual(limit, viewer.command_in_flight);
+    try testing.expectEqual(total, viewer.command_queue.len());
+
+    var buf: [64]u8 = undefined;
+    for (0..total) |i| {
+        _ = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{
+            .data = testMarker(&buf, @intCast(i)),
+        } } });
+        if (i < 3) {
+            const command = testCommand(actions).?;
+            try testing.expectEqual(1, std.mem.count(u8, command, "send-keys"));
+            try testing.expect(std.mem.indexOf(u8, command, testMarker(&buf, @intCast(limit + i))) != null);
+        } else try testing.expect(testCommand(actions) == null);
+        try testing.expectEqual(@min(limit, total - i - 1), viewer.command_in_flight);
+    }
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "tmux input pipeline respects control commands and captures" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    _ = viewer.sendInput(0, "a");
+    _ = viewer.sendInput(0, "b");
+    try testing.expectEqual(0, viewer.sendCommand("display-message -p a ; display-message -p b\n").len);
+    try testing.expectEqual(0, viewer.sendInput(0, "c").len);
+    try testing.expectEqual(0, viewer.sendInput(0, "d").len);
+    try testing.expectEqual(0, viewer.capturePane(0).len);
+    try testing.expectEqual(0, viewer.sendInput(0, "e").len);
+
+    var buf: [64]u8 = undefined;
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 0) } } });
+    try testing.expectEqual(1, viewer.command_in_flight);
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 1) } } });
+        const command = testCommand(actions).?;
+        try testing.expect(std.mem.startsWith(u8, command, "display-message -p a ;"));
+        try testing.expect(std.mem.indexOf(u8, command, "send-keys") == null);
+    }
+    // Neither an ordinary block nor a later input's marker releases the barrier.
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = .{ .data = "a" } } }).len);
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_err = .{ .data = testMarker(&buf, 3) } } }).len);
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 2) } } });
+        const command = testCommand(actions).?;
+        try testing.expectEqual(2, std.mem.count(u8, command, "send-keys"));
+        try testing.expect(std.mem.indexOf(u8, command, "capture-pane") == null);
+    }
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 3) } } });
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 4) } } });
+        try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "capture-pane"));
+    }
+    // The captures and state request still run one at a time.
+    for (0..2) |_| {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+        try testing.expect(std.mem.indexOf(u8, testCommand(actions).?, "send-keys") == null);
+        try testing.expectEqual(1, viewer.command_in_flight);
+    }
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+        try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "send-keys"));
+    }
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 5) } } });
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "tmux session change preserves every pipelined reply" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    for (0..3) |_| _ = viewer.sendInput(0, "x");
+    _ = viewer.sendCommand("display-message -p after\n");
+    _ = viewer.sendInput(0, "y");
+    {
+        const actions = viewer.next(.{ .tmux = .{ .session_changed = .{ .id = 1, .name = "other" } } });
+        try testing.expect(testHasAction(actions, .windows));
+        try testing.expect(testCommand(actions) == null);
+        try testing.expectEqual(3, viewer.command_in_flight);
+    }
+    var buf: [64]u8 = undefined;
+    for (0..3) |i| {
+        _ = viewer.next(.{ .tmux = .{ .block_err = .{ .data = "old pane closed" } } });
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, @intCast(i)) } } });
+        if (i == 2) {
+            try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "list-windows"));
+        } else try testing.expect(testCommand(actions) == null);
+    }
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+        try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "display-message -p after"));
+    }
+    {
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 3) } } });
+        try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "send-keys"));
+    }
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 4) } } });
+    try testing.expectEqual(1, viewer.session_id);
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "tmux detach stops the input pipeline" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+    for (0..Viewer.input_pipeline_limit + 1) |_| _ = viewer.sendInput(0, "x");
+    viewer.detach();
+    try testing.expectEqual(0, viewer.sendInput(0, "y").len);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 0) } } }).len);
 }
