@@ -16,6 +16,11 @@ pub const Message = union(enum) {
     /// in the future.
     pub const WriteReq = MessageData(u8, 38);
 
+    pub const TmuxWindowSize = if (terminal.options.tmux_control_mode)
+        terminal.tmux.Viewer.WindowSize
+    else
+        void;
+
     /// Request a color scheme report is sent to the PTY.
     color_scheme_report: struct {
         /// Force write the current color scheme
@@ -93,6 +98,10 @@ pub const Message = union(enum) {
     /// block that has to be matched against the viewer's command queue.
     /// The data must include its trailing newline.
     tmux_command: WriteReq.Alloc,
+
+    /// Latest preferred size for a native tmux window. The viewer coalesces
+    /// unsent sizes without changing the order of other control commands.
+    tmux_window_size: TmuxWindowSize,
 
     /// Terminal input eligible for pipelined send-keys commands. The
     /// first eight bytes are the little-endian pane ID, followed by input.

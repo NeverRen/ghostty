@@ -362,6 +362,7 @@ fn drainMailbox(
                 io.tmuxEcho(v.data);
             },
             .tmux_capture_pane => |v| io.tmuxCapturePane(data, v),
+            .tmux_window_size => |v| io.tmuxResizeWindow(data, v),
             .tmux_refresh_windows => io.tmuxRefreshWindows(data),
             .tmux_logging_toggle => io.tmuxToggleLogging(),
             .tmux_force_quit => io.tmuxForceQuit(),

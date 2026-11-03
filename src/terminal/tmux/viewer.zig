@@ -497,6 +497,43 @@ pub const Viewer = struct {
         return self.sendUserCommand(command, false);
     }
 
+    /// A control client's preferred size for one window. This is separate
+    /// from arbitrary commands so unsent intermediate sizes can be replaced
+    /// while a slow connection is still acknowledging an earlier resize.
+    pub const WindowSize = struct {
+        id: usize,
+        columns: size.CellCountInt,
+        rows: size.CellCountInt,
+    };
+
+    pub fn resizeWindow(self: *Viewer, value: WindowSize) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        // Only replace unsent sizes after the last non-resize command.
+        // Captures and input must observe the size queued before them.
+        var it = self.command_queue.iterator(.reverse);
+        var remaining = self.command_queue.len() - self.command_in_flight;
+        while (remaining > 0) : (remaining -= 1) {
+            const command = it.next().?;
+            if (command.* != .window_size) break;
+            if (command.window_size.id == value.id) {
+                command.window_size = value;
+                return &.{};
+            }
+        }
+
+        const command: Command = .{ .window_size = value };
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        var builder: std.Io.Writer.Allocating = .init(arena.allocator());
+        command.formatCommand(&builder.writer) catch return &.{};
+        const send = self.command_queue.empty();
+        self.queueCommands(&.{command}) catch return &.{};
+        if (!send) return &.{};
+        self.command_in_flight = 1;
+        return self.singleAction(.{ .command = builder.writer.buffered() });
+    }
+
     /// Send terminal input without waiting for each preceding input's
     /// reply. Only commands encoded here may enter the input pipeline;
     /// arbitrary user commands can change the session or run asynchronously.
@@ -622,10 +659,9 @@ pub const Viewer = struct {
             return &.{};
         }
 
-        // Three commands rather than a `;` sequence because tmux wraps
-        // every command of a sequence in its own begin/end block, which
-        // our queue matches one-to-one. They are queued together, so
-        // their replies arrive one right after another.
+        // Three known commands, each with one reply block. Send them as
+        // one batch so startup doesn't wait three network round trips and
+        // the screens and cursor are sampled together on the server.
         const command: Command = .{ .follower_capture = .{
             .id = pane_id,
             .screen_key = .primary,
@@ -643,14 +679,11 @@ pub const Viewer = struct {
 
         var arena = self.action_arena.promote(self.alloc);
         defer self.action_arena = arena.state;
-        var builder: std.Io.Writer.Allocating = .init(arena.allocator());
-        command.formatCommand(&builder.writer) catch {
-            log.warn("failed to format capture-pane, dropping", .{});
-            return &.{};
+        const action = self.sendQueuedCommands(arena.allocator()) catch {
+            log.warn("failed to format capture-pane, becoming defunct", .{});
+            return self.defunct();
         };
-
-        self.command_in_flight = 1;
-        return self.singleAction(.{ .command = builder.writer.buffered() });
+        return self.singleAction(action.?);
     }
 
     fn nextTmux(
@@ -1309,7 +1342,7 @@ pub const Viewer = struct {
 
         // Process our command
         switch (command) {
-            .user, .stale => {},
+            .user, .stale, .window_size => {},
 
             .follower_capture => |cap| try self.receivedFollowerCapture(cap, content),
 
@@ -2051,8 +2084,9 @@ pub const Viewer = struct {
         return self.singleAction(action);
     }
 
-    /// Emit unsent input up to the pipeline limit. Queries and arbitrary
-    /// user commands wait for all preceding replies and run alone.
+    /// Emit unsent input up to the pipeline limit. A follower's capture
+    /// triplet runs as one batch. Other queries and arbitrary user commands
+    /// wait for all preceding replies and run alone.
     fn sendQueuedCommands(self: *Viewer, alloc: Allocator) !?Action {
         assert(self.command_in_flight <= self.command_queue.len());
         if (self.command_queue.empty()) return null;
@@ -2069,7 +2103,26 @@ pub const Viewer = struct {
             if (!command.isInput() and in_flight > 0) break;
             try command.formatCommand(&builder.writer);
             count += 1;
-            if (!command.isInput()) break;
+            if (!command.isInput()) {
+                if (command.* == .follower_capture and
+                    command.follower_capture.screen_key == .primary)
+                {
+                    // capturePane always queues this triplet together.
+                    // No later input or resize can run until all three
+                    // replies have been consumed, including error replies.
+                    const alternate = it.next().?;
+                    const state = it.next().?;
+                    assert(alternate.* == .follower_capture);
+                    assert(alternate.follower_capture.screen_key == .alternate);
+                    assert(alternate.follower_capture.id == command.follower_capture.id);
+                    assert(state.* == .follower_state);
+                    assert(state.follower_state == command.follower_capture.id);
+                    try alternate.formatCommand(&builder.writer);
+                    try state.formatCommand(&builder.writer);
+                    count += 2;
+                }
+                break;
+            }
         }
         if (count == 0) return null;
         self.command_in_flight += count;
@@ -2149,6 +2202,9 @@ const State = enum {
 };
 
 const Command = union(enum) {
+    /// The latest requested client size, coalesced until it is sent.
+    window_size: Viewer.WindowSize,
+
     /// List all windows so we can sync our window state.
     list_windows,
 
@@ -2238,6 +2294,7 @@ const Command = union(enum) {
             .follower_capture,
             .follower_state,
             .stale,
+            .window_size,
             => {},
             .user => |v| alloc.free(v.line),
         };
@@ -2251,6 +2308,11 @@ const Command = union(enum) {
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         switch (self) {
+            .window_size => |v| try writer.print(
+                "refresh-client -C @{d}:{d}x{d}\n",
+                .{ v.id, v.columns, v.rows },
+            ),
+
             .list_windows => try writer.writeAll(std.fmt.comptimePrint(
                 "list-windows -F '{s}'\n",
                 .{comptime Format.list_windows.comptimeFormat()},
@@ -4117,13 +4179,16 @@ test "pane restore gathers both screens and the state" {
 
     const first = viewer.capturePane(0);
     try testing.expect(std.mem.startsWith(u8, testCommand(first).?, "capture-pane -p -e -C -J -q -t %0"));
+    try testing.expectEqual(2, std.mem.count(u8, testCommand(first).?, "capture-pane"));
+    try testing.expect(std.mem.indexOf(u8, testCommand(first).?, "display-message -p -t %0 -F '") != null);
+    try testing.expectEqual(3, viewer.command_in_flight);
     {
         const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = "one\\134two\ntwo\n" } } });
-        try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "capture-pane -p -e -C -J -q -a -t %0"));
+        try testing.expect(testCommand(actions) == null);
     }
     {
         const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = "vim\n" } } });
-        try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "display-message -p -t %0 -F '"));
+        try testing.expect(testCommand(actions) == null);
     }
     const actions = viewer.next(.{ .tmux = .{ .block_end = .{
         .data = "%0;1;2;1;default;none;0;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;23;",
@@ -4676,11 +4741,13 @@ test "tmux input pipeline respects control commands and captures" {
         const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 4) } } });
         try testing.expect(std.mem.startsWith(u8, testCommand(actions).?, "capture-pane"));
     }
-    // The captures and state request still run one at a time.
-    for (0..2) |_| {
+    // Both captures and the state request are in flight, but later input
+    // still waits for the complete batch.
+    try testing.expectEqual(3, viewer.command_in_flight);
+    for (0..2) |i| {
         const actions = viewer.next(.{ .tmux = .{ .block_end = .{} } });
-        try testing.expect(std.mem.indexOf(u8, testCommand(actions).?, "send-keys") == null);
-        try testing.expectEqual(1, viewer.command_in_flight);
+        try testing.expect(testCommand(actions) == null);
+        try testing.expectEqual(2 - i, viewer.command_in_flight);
     }
     {
         const actions = viewer.next(.{ .tmux = .{ .block_end = .{} } });
@@ -4734,4 +4801,92 @@ test "tmux detach stops the input pipeline" {
     try testing.expectEqual(0, viewer.sendInput(0, "y").len);
     var buf: [64]u8 = undefined;
     try testing.expectEqual(0, viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 0) } } }).len);
+}
+
+test "tmux resize coalesces unsent sizes per window" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    try testing.expectEqualStrings("refresh-client -C @0:81x24\n", testCommand(viewer.resizeWindow(.{
+        .id = 0,
+        .columns = 81,
+        .rows = 24,
+    })).?);
+    for (82..150) |columns| {
+        try testing.expectEqual(0, viewer.resizeWindow(.{ .id = 0, .columns = @intCast(columns), .rows = 30 }).len);
+        try testing.expectEqual(0, viewer.resizeWindow(.{ .id = 1, .columns = @intCast(columns), .rows = 40 }).len);
+    }
+    try testing.expectEqual(3, viewer.command_queue.len());
+    try testing.expectEqual(1, viewer.command_in_flight);
+    try testing.expectEqual(81, viewer.command_queue.first().?.window_size.columns);
+
+    // Even an error releases the in-flight size; the latest sizes of both
+    // windows are sent exactly once and their replies retain their places.
+    try testing.expectEqualStrings("refresh-client -C @0:149x30\n", testCommand(viewer.next(.{ .tmux = .{ .block_err = .{ .data = "window closed" } } })).?);
+    try testing.expectEqualStrings("refresh-client -C @1:149x40\n", testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })).?);
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "tmux resize preserves capture and input ordering" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    _ = viewer.sendInput(0, "a");
+    _ = viewer.resizeWindow(.{ .id = 0, .columns = 90, .rows = 30 });
+    _ = viewer.capturePane(0);
+    _ = viewer.resizeWindow(.{ .id = 0, .columns = 100, .rows = 30 });
+    _ = viewer.resizeWindow(.{ .id = 0, .columns = 110, .rows = 30 });
+    _ = viewer.sendInput(0, "b");
+    _ = viewer.resizeWindow(.{ .id = 0, .columns = 120, .rows = 30 });
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("refresh-client -C @0:90x30\n", testCommand(viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 0) } } })).?);
+    {
+        const command = testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })).?;
+        try testing.expectEqual(2, std.mem.count(u8, command, "capture-pane"));
+        try testing.expect(std.mem.indexOf(u8, command, "refresh-client") == null);
+        try testing.expect(std.mem.indexOf(u8, command, "send-keys") == null);
+    }
+    for (0..2) |_| {
+        try testing.expect(testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })) == null);
+    }
+    try testing.expectEqualStrings("refresh-client -C @0:110x30\n", testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })).?);
+    try testing.expect(std.mem.startsWith(u8, testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })).?, "send-keys"));
+    try testing.expectEqualStrings("refresh-client -C @0:120x30\n", testCommand(viewer.next(.{ .tmux = .{ .block_end = .{ .data = testMarker(&buf, 1) } } })).?);
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "tmux resize discards unsent sizes on session change" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+
+    _ = viewer.resizeWindow(.{ .id = 0, .columns = 90, .rows = 30 });
+    _ = viewer.resizeWindow(.{ .id = 0, .columns = 100, .rows = 30 });
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{ .id = 1, .name = "other" } } });
+    try testing.expect(std.mem.startsWith(u8, testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })).?, "list-windows"));
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+    try testing.expect(viewer.command_queue.empty());
+    viewer.detach();
+    try testing.expectEqual(0, viewer.resizeWindow(.{ .id = 0, .columns = 110, .rows = 30 }).len);
+}
+
+test "tmux capture batch preserves replies across session changes" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    try testAttach(&viewer, "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell");
+    _ = viewer.capturePane(0);
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{ .id = 1, .name = "other" } } });
+    try testing.expectEqual(3, viewer.command_in_flight);
+    for (0..2) |_| {
+        const actions = viewer.next(.{ .tmux = .{ .block_err = .{ .data = "pane gone" } } });
+        try testing.expect(!testHasAction(actions, .pane_restore));
+        try testing.expect(testCommand(actions) == null);
+    }
+    try testing.expect(std.mem.startsWith(u8, testCommand(viewer.next(.{ .tmux = .{ .block_end = .{} } })).?, "list-windows"));
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{} } });
+    try testing.expect(viewer.command_queue.empty());
 }

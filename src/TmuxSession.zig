@@ -356,6 +356,13 @@ pub const Session = struct {
         if (grid) |v| self.grids.put(self.alloc, pane_id, v) catch |err| {
             log.warn("failed to track tmux pane grid err={}", .{err});
         };
+        // Native tabs report their actual allocation after initialization.
+        // Capturing here before that report restores the old server-sized
+        // screen and holds the first resize behind the capture round trips.
+        if (comptime native_layout) {
+            const window = self.pane_window.get(pane_id) orelse return;
+            if (!self.window_sizes.contains(window)) return;
+        }
         self.capturePane(pane_id);
     }
 
@@ -1215,6 +1222,17 @@ pub const Session = struct {
         else
             &.{window};
         for (group) |id| self.sizeWindow(id, grid);
+
+        // Size commands precede the initial captures. A pane initialized
+        // later uses paneRegistered; already initialized panes start here.
+        var panes = self.pane_to_surface.keyIterator();
+        while (panes.next()) |pane| {
+            if (!self.grids.contains(pane.*)) continue;
+            const pane_window = self.pane_window.get(pane.*) orelse continue;
+            if (std.mem.indexOfScalar(usize, group, pane_window) != null) {
+                self.capturePane(pane.*);
+            }
+        }
     }
 
     const PixelSize = struct { width: u32, height: u32 };
@@ -1227,9 +1245,13 @@ pub const Session = struct {
             log.warn("failed to track tmux window size err={}", .{err});
             return;
         };
-        self.sendCommandFmt(
-            "refresh-client -C @{d}:{d}x{d}\n",
-            .{ window_id, size.columns, size.rows },
+        self.leader.io.queueMessage(
+            .{ .tmux_window_size = .{
+                .id = window_id,
+                .columns = size.columns,
+                .rows = size.rows,
+            } },
+            .unlocked,
         );
     }
 
@@ -2153,4 +2175,46 @@ test "tmux registry removes one connection and rejects stale attaches" {
     try testing.expect(!reattached.canClaim(.{ .session = old_attach, .window = 0, .pane = 0 }));
     try testing.expect(reattached.canClaim(.{ .session = reattached.attach, .window = 0, .pane = 0 }));
     try testing.expectEqual(second, registry.get(second.attach).?);
+}
+
+test "tmux attach calibrates the window before capturing followers" {
+    if (comptime !native_layout) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var gateway: Surface = undefined;
+    gateway.io.mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer gateway.io.mailbox.deinit(alloc);
+    const queue = gateway.io.mailbox.spsc.queue;
+    var session: Session = .init(alloc, &gateway);
+    defer session.deinit();
+
+    var follower: Surface = undefined;
+    follower.size = .{
+        .screen = .{ .width = 1000, .height = 600 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+    try session.pane_window.put(alloc, 0, 0);
+    try session.pane_to_surface.put(alloc, 0, &follower);
+    session.paneRegistered(0, .{ .columns = 80, .rows = 24 });
+    try testing.expect(queue.pop(testing.io) == null);
+    try testing.expect(!session.captured.contains(0));
+
+    session.sizeView(&follower, 0, .{ .width = 1000, .height = 600 });
+    try testing.expectEqual(termio.Message{ .tmux_window_size = .{
+        .id = 0,
+        .columns = 100,
+        .rows = 30,
+    } }, queue.pop(testing.io).?);
+    try testing.expectEqual(termio.Message{ .tmux_capture_pane = 0 }, queue.pop(testing.io).?);
+    try testing.expect(queue.pop(testing.io) == null);
+
+    // Repeated allocations don't recapture the screen or send duplicate sizes.
+    session.sizeView(&follower, 0, .{ .width = 1000, .height = 600 });
+    try testing.expect(queue.pop(testing.io) == null);
+
+    // A split initialized after calibration can capture immediately.
+    try session.pane_window.put(alloc, 1, 0);
+    session.paneRegistered(1, .{ .columns = 49, .rows = 30 });
+    try testing.expectEqual(termio.Message{ .tmux_capture_pane = 1 }, queue.pop(testing.io).?);
 }

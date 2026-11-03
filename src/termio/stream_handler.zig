@@ -901,6 +901,7 @@ pub const StreamHandler = struct {
         request: union(enum) {
             command: []const u8,
             input: struct { pane_id: ?usize, data: []const u8 },
+            window_size: termio.Message.TmuxWindowSize,
         },
     ) ?[]const u8 {
         if (comptime !tmux_enabled) return null;
@@ -915,6 +916,7 @@ pub const StreamHandler = struct {
                 break :command viewer.sendCommand(command);
             },
             .input => |input| viewer.sendInput(input.pane_id, input.data),
+            .window_size => |value| viewer.resizeWindow(value),
         };
 
         var result: ?[]const u8 = null;

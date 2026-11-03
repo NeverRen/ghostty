@@ -3570,6 +3570,14 @@ pub const Surface = extern struct {
                 if (self.getTmuxPane() != null) priv.tmux_init_failed = true;
             };
         }
+
+        // On attach the server still has the old client's geometry. Report
+        // the new tab size immediately, before its initial pane capture.
+        if (self.getTmuxPane() != null) {
+            if (ext.getAncestor(SplitTree, self.as(gtk.Widget))) |tree| {
+                tree.syncTmuxSize();
+            }
+        }
     }
 
     const InitError = Allocator.Error || error{

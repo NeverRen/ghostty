@@ -720,6 +720,20 @@ pub fn tmuxCommand(self: *Termio, td: *ThreadData, command: []const u8) void {
     };
 }
 
+/// Update a native tmux window's preferred size through the viewer queue.
+pub fn tmuxResizeWindow(self: *Termio, td: *ThreadData, value: termio.Message.TmuxWindowSize) void {
+    if (comptime !StreamHandler.tmux_enabled) return;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    self.tmuxFlushWrites(td);
+    const data = self.terminal_stream.handler.tmuxSubmitCommand(.{ .window_size = value }) orelse return;
+    self.queueWrite(td, data, false) catch |err| {
+        log.warn("error writing tmux window size err={}", .{err});
+    };
+}
+
 /// Flush commands emitted by the reader. See termio.Message.tmux_write.
 pub fn tmuxWrite(self: *Termio, td: *ThreadData) void {
     if (comptime !StreamHandler.tmux_enabled) return;

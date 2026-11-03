@@ -177,10 +177,8 @@ pub const SplitTree = extern struct {
         /// Set when this tree mirrors a tmux window. See applyTmuxTree.
         tmux: ?Tmux = null,
 
-        /// The source that reports our size to tmux once allocation is
-        /// done, and the size last reported. See snapshot.
-        tmux_size_source: ?c_uint = null,
-        tmux_size: [2]c_int = .{ 0, 0 },
+        /// Last reported tab size in physical pixels. See syncTmuxSize.
+        tmux_size: [2]u32 = .{ 0, 0 },
 
         /// A divider the user dragged, reported to tmux once the drag
         /// pauses. See tmuxSplitDragged.
@@ -649,6 +647,8 @@ pub const SplitTree = extern struct {
         tmux: Tmux,
     ) void {
         const priv = self.private();
+        if (priv.tmux == null or priv.tmux.?.session != tmux.session or
+            priv.tmux.?.window != tmux.window) priv.tmux_size = .{ 0, 0 };
         priv.tmux = tmux;
         if (focused) |v| priv.last_focused.set(v);
 
@@ -887,12 +887,6 @@ pub const SplitTree = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.last_focused.deinit();
-        if (priv.tmux_size_source) |v| {
-            if (glib.Source.remove(v) == 0) {
-                log.warn("unable to remove tmux size source", .{});
-            }
-            priv.tmux_size_source = null;
-        }
         self.cancelTmuxDrag();
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
@@ -935,9 +929,9 @@ pub const SplitTree = extern struct {
     /// out in the cells that fit the tab. Only the tab that is shown gets
     /// drawn, so it speaks for every tab of its native window.
     ///
-    /// This is checked on every snapshot rather than on allocation because
-    /// a widget with a layout manager, like ours, never has its
-    /// size_allocate called; a size change always redraws it though.
+    /// Surfaces report after allocation. Also check snapshots for tab
+    /// changes that don't resize a surface; our layout manager bypasses
+    /// the widget's size_allocate virtual method.
     fn snapshot(self: *Self, snap: *gtk.Snapshot) callconv(.c) void {
         gtk.Widget.virtual_methods.snapshot.call(
             Class.parent,
@@ -945,38 +939,32 @@ pub const SplitTree = extern struct {
             snap,
         );
 
-        // Reported once allocation settles; allocations come in bursts
-        // while a window is resized.
-        const priv = self.private();
-        if (priv.tmux == null) return;
-        const widget = self.as(gtk.Widget);
-        if (priv.tmux_size[0] == widget.getWidth() and
-            priv.tmux_size[1] == widget.getHeight()) return;
-        if (priv.tmux_size_source == null) priv.tmux_size_source = glib.idleAdd(
-            onTmuxSize,
-            self,
-        );
+        self.syncTmuxSize();
     }
 
-    fn onTmuxSize(ud: ?*anyopaque) callconv(.c) c_int {
-        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+    /// Calibrate as soon as a follower has its actual font and allocation.
+    /// A default-priority idle can be starved during continuous redraws.
+    /// The viewer coalesces unsent sizes, so no UI-side debounce is needed.
+    pub fn syncTmuxSize(self: *Self) void {
         const priv = self.private();
-        priv.tmux_size_source = null;
-
-        const tmux = priv.tmux orelse return 0;
+        const tmux = priv.tmux orelse return;
+        const core = self.getTmuxCore() orelse return;
         const widget = self.as(gtk.Widget);
         const width = widget.getWidth();
         const height = widget.getHeight();
-        if (width <= 0 or height <= 0) return 0;
+        if (width <= 0 or height <= 0) return;
 
-        priv.tmux_size = .{ width, height };
         const scale = scale_util.widgetSurfaceScale(widget);
-        _ = self.tmuxNativeEvent(.{ .view_size = .{
+        const pixels: [2]u32 = .{
+            @intFromFloat(@round(@as(f64, @floatFromInt(width)) * scale)),
+            @intFromFloat(@round(@as(f64, @floatFromInt(height)) * scale)),
+        };
+        if (std.meta.eql(priv.tmux_size, pixels)) return;
+        if (core.tmuxNativeEvent(.{ .view_size = .{
             .tab = .{ .session = tmux.session, .window = tmux.window },
-            .width = @intFromFloat(@round(@as(f64, @floatFromInt(width)) * scale)),
-            .height = @intFromFloat(@round(@as(f64, @floatFromInt(height)) * scale)),
-        } });
-        return 0;
+            .width = pixels[0],
+            .height = pixels[1],
+        } })) priv.tmux_size = pixels;
     }
 
     //---------------------------------------------------------------
