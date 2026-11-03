@@ -69,10 +69,8 @@ last_notification_digest: u64 = 0,
 /// to the app-level config and as a default for new surfaces.
 config_conditional_state: configpkg.ConditionalState,
 
-/// The active tmux control mode session, if any. Only one surface can be
-/// the gateway at a time, so this lives on the app rather than on a
-/// surface.
-tmux: ?TmuxSession.Session = null,
+/// Independent tmux control-mode connections, each owned by its gateway.
+tmux: TmuxSession.Registry = .{},
 
 /// Set to false once we've created at least one surface. This
 /// never goes true again. This can be used by surfaces to determine
@@ -144,16 +142,15 @@ pub fn init(
 /// pane, and quitting closes them all. The session survives with all of
 /// its windows and panes.
 pub fn tmuxDetachForQuit(self: *App) void {
-    const session = if (self.tmux) |*s| s else return;
-    session.detach();
-    session.leader.tmuxTeardown();
+    while (self.tmux.sessions.count() > 0) {
+        const session = self.tmux.sessions.values()[0];
+        session.detach();
+        session.leader.tmuxTeardown();
+    }
 }
 
 pub fn deinit(self: *App) void {
-    if (self.tmux) |*session| {
-        session.deinit();
-        self.tmux = null;
-    }
+    self.tmux.deinit(self.alloc);
 
     // Clean up all our surfaces
     for (self.surfaces.items) |surface| surface.deinit();
@@ -186,7 +183,7 @@ pub fn tick(self: *App, rt_app: *apprt.App) !void {
     // A tmux follower registered since the last tick, so the session can
     // create the next one. It waits for a tick of its own because surface
     // presentation is asynchronous on some apprts (macOS).
-    if (self.tmux) |*session| if (session.advance_pending) {
+    for (self.tmux.sessions.values()) |session| if (session.advance_pending) {
         session.advance_pending = false;
         session.advance();
     };

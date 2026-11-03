@@ -97,6 +97,61 @@ var attaches: u64 = 0;
 /// spin forever; real sessions are far below it.
 const max_advance = 256;
 
+/// Control-mode connections owned by the app. Each connection has its
+/// own pane IDs and keeps a stable address while other connections enter
+/// or leave. Native tabs identify their connection by its attach serial.
+pub const Registry = struct {
+    sessions: std.AutoArrayHashMapUnmanaged(u64, *Session) = .empty,
+
+    pub fn deinit(self: *Registry, alloc: Allocator) void {
+        for (self.sessions.values()) |session| {
+            session.deinit();
+            alloc.destroy(session);
+        }
+        self.sessions.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn create(self: *Registry, alloc: Allocator, leader: *Surface) !*Session {
+        if (self.forSurface(leader) != null) return error.AlreadyAttached;
+        const session = try alloc.create(Session);
+        errdefer alloc.destroy(session);
+        session.* = .init(alloc, leader);
+        errdefer session.deinit();
+        try self.sessions.put(alloc, session.attach, session);
+        return session;
+    }
+
+    pub fn get(self: *const Registry, attach: u64) ?*Session {
+        return self.sessions.get(attach);
+    }
+
+    pub fn forSurface(self: *const Registry, surface: *const Surface) ?*Session {
+        for (self.sessions.values()) |session| {
+            if (session.isLeader(surface) or session.isFollower(surface)) return session;
+        }
+        return null;
+    }
+
+    /// Transfer ownership before closing followers, whose destruction can
+    /// re-enter the registry. Other connections remain available.
+    pub fn take(self: *Registry, attach: u64) ?*Session {
+        const session = self.get(attach) orelse return null;
+        const removed = self.sessions.swapRemove(attach);
+        std.debug.assert(removed);
+        return session;
+    }
+
+    /// Apprts without explicit pane identities still create followers one
+    /// at a time, and only support one connection at a time.
+    pub fn pending(self: *const Registry) ?*Session {
+        for (self.sessions.values()) |session| {
+            if (session.shouldCreateFollower()) return session;
+        }
+        return null;
+    }
+};
+
 pub const Session = struct {
     alloc: Allocator,
 
@@ -2024,4 +2079,78 @@ fn findPaneGrid(layout: Layout, visible: ?Layout, pane_id: usize) ?renderer.Grid
         },
     }
     return null;
+}
+
+test "tmux registry isolates connections with colliding pane IDs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var registry: Registry = .{};
+    defer registry.deinit(alloc);
+
+    // Only identity is used by the registry; these surfaces have no IO.
+    var gateways: [2]Surface = undefined;
+    var followers: [2]Surface = undefined;
+    var sessions: [2]*Session = undefined;
+    for (&gateways, &followers, &sessions, 0..) |*gateway, *follower, *session, i| {
+        gateway.id = i * 2;
+        follower.id = i * 2 + 1;
+        session.* = try registry.create(alloc, gateway);
+        try session.*.pane_window.put(alloc, 0, 0);
+        try testing.expect(session.*.canClaim(.{
+            .session = session.*.attach,
+            .window = 0,
+            .pane = 0,
+        }));
+        session.*.registerPane(0, follower);
+    }
+
+    try testing.expect(sessions[0].attach != sessions[1].attach);
+    for (&gateways, &followers, sessions) |*gateway, *follower, session| {
+        try testing.expectEqual(session, registry.forSurface(gateway).?);
+        try testing.expectEqual(session, registry.forSurface(follower).?);
+        try testing.expectEqual(session, registry.get(session.attach).?);
+        try testing.expectEqual(follower, session.surfaceForPane(0).?);
+        try testing.expectError(error.AlreadyAttached, registry.create(alloc, gateway));
+        try testing.expectError(error.AlreadyAttached, registry.create(alloc, follower));
+    }
+
+    sessions[0].releaseSurface(&followers[0]);
+    try testing.expect(registry.forSurface(&followers[0]) == null);
+    try testing.expectEqual(sessions[1], registry.forSurface(&followers[1]).?);
+    try testing.expect(!sessions[0].canClaim(.{
+        .session = sessions[1].attach,
+        .window = 0,
+        .pane = 0,
+    }));
+}
+
+test "tmux registry removes one connection and rejects stale attaches" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var registry: Registry = .{};
+    defer registry.deinit(alloc);
+
+    var gateways: [2]Surface = undefined;
+    for (&gateways, 0..) |*gateway, i| gateway.id = i;
+    const first = try registry.create(alloc, &gateways[0]);
+    const second = try registry.create(alloc, &gateways[1]);
+    const old_attach = first.attach;
+    const removed = registry.take(old_attach).?;
+    defer {
+        removed.deinit();
+        alloc.destroy(removed);
+    }
+
+    // The detached connection is invisible before its followers close.
+    try testing.expect(registry.forSurface(&gateways[0]) == null);
+    try testing.expect(registry.get(old_attach) == null);
+    try testing.expect(registry.take(old_attach) == null);
+    try testing.expectEqual(second, registry.forSurface(&gateways[1]).?);
+
+    const reattached = try registry.create(alloc, &gateways[0]);
+    try testing.expect(reattached.attach != old_attach);
+    try reattached.pane_window.put(alloc, 0, 0);
+    try testing.expect(!reattached.canClaim(.{ .session = old_attach, .window = 0, .pane = 0 }));
+    try testing.expect(reattached.canClaim(.{ .session = reattached.attach, .window = 0, .pane = 0 }));
+    try testing.expectEqual(second, registry.get(second.attach).?);
 }

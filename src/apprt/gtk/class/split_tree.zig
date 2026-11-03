@@ -799,12 +799,12 @@ pub const SplitTree = extern struct {
     /// tree. Returns false if no session mirrors it, so that the caller
     /// handles it natively.
     pub fn tmuxNativeEvent(self: *Self, event: TmuxSession.Session.NativeEvent) bool {
-        if (self.private().tmux == null) return false;
+        const tmux = self.private().tmux orelse return false;
 
         // A tab whose surfaces haven't initialized yet has no core surface
         // to go through, but the gateway has the same font and padding.
         const core: *CoreSurface = self.getTmuxCore() orelse gateway: {
-            const session = if (Application.default().core().tmux) |*v| v else return false;
+            const session = Application.default().core().tmux.get(tmux.session) orelse return false;
             break :gateway session.leader;
         };
         return core.tmuxNativeEvent(event);

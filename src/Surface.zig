@@ -504,7 +504,7 @@ pub fn init(
     // the tab it was created for. Don't build a terminal for it.
     if (comptime terminal.options.tmux_control_mode and TmuxSession.native_layout) {
         if (rt_surface.tmuxPane()) |pane| {
-            const session = if (app.tmux) |*s| s else return error.TmuxPaneUnavailable;
+            const session = app.tmux.get(pane.session) orelse return error.TmuxPaneUnavailable;
             if (!session.canClaim(pane)) return error.TmuxPaneUnavailable;
         }
     }
@@ -694,14 +694,13 @@ pub fn init(
             // fall back to a shell: the tab it is in shows a tmux window.
             // The start of init made sure the pane can be claimed.
             const pane = rt_surface.tmuxPane() orelse break :tmux;
-            const session = &app.tmux.?;
+            const session = app.tmux.get(pane.session).?;
             assert(session.canClaim(pane));
             self.tmux_pane_id = pane.pane;
             self.tmux_grid = session.paneGrid(pane.pane);
             session.registerPane(pane.pane, self);
         } else {
-            const session = if (app.tmux) |*s| s else break :tmux;
-            if (!session.shouldCreateFollower()) break :tmux;
+            const session = app.tmux.pending() orelse break :tmux;
             const pane_id = session.takePane() orelse break :tmux;
             self.tmux_pane_id = pane_id;
             session.registerPane(pane_id, self);
@@ -710,7 +709,7 @@ pub fn init(
     errdefer if (comptime terminal.options.tmux_control_mode) {
         if (self.tmux_pane_id != null) {
             // The pane stays in the layout, so only the mapping goes.
-            if (app.tmux) |*session| if (comptime TmuxSession.native_layout)
+            if (self.tmuxSession()) |session| if (comptime TmuxSession.native_layout)
                 session.releaseSurface(self)
             else
                 session.unregisterSurface(self);
@@ -899,7 +898,7 @@ pub fn init(
         if (self.tmux_pane_id) |pane_id| {
             if (comptime TmuxSession.native_layout) {
                 // We're at the pane's size now, so its contents fit.
-                if (app.tmux) |*session| session.paneRegistered(pane_id, self.tmux_grid);
+                if (self.tmuxSession()) |session| session.paneRegistered(pane_id, self.tmux_grid);
             } else {
                 // Now that we can be split from, let the session create
                 // the next pane on the next app tick. This is a no-op when
@@ -907,7 +906,7 @@ pub fn init(
                 // already inside that loop. A flag rather than a mailbox
                 // message: this is the app thread, the only one that
                 // drains the app mailbox, so it must not wait for room.
-                if (app.tmux) |*session| session.advance_pending = true;
+                if (self.tmuxSession()) |session| session.advance_pending = true;
                 self.rt_app.wakeup();
             }
         }
@@ -2659,7 +2658,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     // different number of cells fits the tab now.
     if (comptime terminal.options.tmux_control_mode) {
         if (self.tmux_pane_id != null) {
-            if (self.app.tmux) |*session| session.cellSizeChanged(self);
+            if (self.tmuxSession()) |session| session.cellSizeChanged(self);
         }
     }
 }
@@ -3620,7 +3619,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
         if (!focused) break :tmux;
         if (self.focused == focused) break :tmux;
         const pane = self.tmux_pane_id orelse break :tmux;
-        const session = if (self.app.tmux) |*s| s else break :tmux;
+        const session = self.tmuxSession() orelse break :tmux;
         if (!session.isFollower(self)) break :tmux;
         session.paneFocused(pane);
     }
@@ -5099,9 +5098,7 @@ fn showMouse(self: *Surface) void {
 /// The tmux session this surface takes part in, if any.
 fn tmuxSession(self: *Surface) ?*TmuxSession.Session {
     if (comptime !terminal.options.tmux_control_mode) return null;
-    const session = if (self.app.tmux) |*s| s else return null;
-    if (!session.isLeader(self) and !session.isFollower(self)) return null;
-    return session;
+    return self.app.tmux.forSurface(self);
 }
 
 /// The session this surface is the gateway of, if any.
@@ -5113,7 +5110,7 @@ fn tmuxSession(self: *Surface) ?*TmuxSession.Session {
 /// panes and tabs by printing control mode notifications.
 fn tmuxGatewaySession(self: *Surface) ?*TmuxSession.Session {
     if (comptime !terminal.options.tmux_control_mode) return null;
-    const session = if (self.app.tmux) |*s| s else return null;
+    const session = self.tmuxSession() orelse return null;
     if (!session.isLeader(self)) return null;
     return session;
 }
@@ -5123,8 +5120,7 @@ fn tmuxGatewaySession(self: *Surface) ?*TmuxSession.Session {
 fn tmuxIsGateway(self: *Surface) bool {
     if (comptime !terminal.options.tmux_control_mode) return false;
     if (!self.io.inTmuxControlMode()) return false;
-    const session = if (self.app.tmux) |*s| s else return false;
-    return session.isLeader(self);
+    return self.tmuxGatewaySession() != null;
 }
 
 /// Handle a binding action that tmux owns while we're attached to a
@@ -5275,7 +5271,7 @@ pub fn tmuxBindingAction(self: *Surface, action: input.Binding.Action) !bool {
 /// the apprt handles it as it would any other tab.
 pub fn tmuxNativeEvent(self: *Surface, event: TmuxSession.Session.NativeEvent) bool {
     if (comptime !terminal.options.tmux_control_mode) return false;
-    const session = if (self.app.tmux) |*s| s else return false;
+    const session = self.tmuxSession() orelse return false;
     return session.nativeEvent(self, event);
 }
 
@@ -5290,7 +5286,7 @@ fn tmuxGatewayKey(self: *Surface, event: input.KeyEvent) bool {
     // reacts to a release, and nothing that reaches it is typed anywhere.
     if (event.action == .release) return true;
 
-    const session = if (self.app.tmux) |*s| s else return false;
+    const session = self.tmuxGatewaySession() orelse return false;
 
     // While the command prompt is up every key belongs to it.
     if (session.prompt) |*prompt| {
@@ -5376,8 +5372,7 @@ fn tmuxGatewayKey(self: *Surface, event: input.KeyEvent) bool {
 fn tmuxForceQuit(self: *Surface) void {
     if (comptime !terminal.options.tmux_control_mode) return;
 
-    const session = if (self.app.tmux) |*s| s else return;
-    if (!session.isLeader(self)) return;
+    const session = self.tmuxGatewaySession() orelse return;
 
     // Best-effort: drop the control client so the mux server is idle.
     // `detach` writes past the viewer queue, which force-quit destroys
@@ -5393,10 +5388,9 @@ fn tmuxForceQuit(self: *Surface) void {
 fn tmuxEnter(self: *Surface) void {
     if (comptime !terminal.options.tmux_control_mode) return;
 
-    if (self.app.tmux != null) {
-        // Only one session can be mirrored at a time. Leave control
-        // mode on this terminal rather than keep a gateway nothing
-        // listens to.
+    if (!TmuxSession.native_layout and self.app.tmux.sessions.count() > 0) {
+        // Apprts without explicit pane identities cannot associate an
+        // asynchronously created surface with one of several connections.
         log.warn("tmux session already active, leaving control mode", .{});
         const text = "\r\nghostty: a tmux control mode session is already " ++
             "attached in another terminal; detach it first.\r\n";
@@ -5410,7 +5404,11 @@ fn tmuxEnter(self: *Surface) void {
         return;
     }
 
-    self.app.tmux = .init(self.alloc, self);
+    _ = self.app.tmux.create(self.app.alloc, self) catch |err| {
+        log.warn("failed to create tmux session err={}", .{err});
+        self.io.queueMessage(.{ .tmux_force_quit = {} }, .unlocked);
+        return;
+    };
     log.info("tmux control mode entered gateway={x}", .{self.id});
 
     // The gateway shows the control plate rather than a shell. Name its
@@ -5470,7 +5468,7 @@ fn tmuxSendKeys(self: *Surface, req: apprt.surface.Message.WriteReq) void {
     defer req.deinit();
     if (comptime !terminal.options.tmux_control_mode) return;
 
-    const session = if (self.app.tmux) |*s| s else return;
+    const session = self.tmuxSession() orelse return;
     const pane = session.paneForSurface(self) orelse return;
     session.sendKeys(pane, req.slice());
 }
@@ -5483,7 +5481,7 @@ fn tmuxResize(self: *Surface, grid_size: rendererpkg.GridSize) void {
     // resizes its pane.
     if (comptime TmuxSession.native_layout) return;
 
-    const session = if (self.app.tmux) |*s| s else return;
+    const session = self.tmuxSession() orelse return;
     const pane = session.paneForSurface(self) orelse return;
     session.resizePane(pane, grid_size.columns, grid_size.rows);
 }
@@ -5590,15 +5588,14 @@ const TmuxTitleFilter = struct {
 pub fn tmuxTeardown(self: *Surface) void {
     if (comptime !terminal.options.tmux_control_mode) return;
 
-    const session = if (self.app.tmux) |*s| s else return;
-    if (!session.isLeader(self)) return;
+    const session = self.tmuxGatewaySession() orelse return;
 
-    // Move the session out before closing followers: closing a surface
-    // re-enters us through its deinit.
-    var owned = session.*;
-    self.app.tmux = null;
+    // Remove only this connection before closing followers: closing a
+    // surface re-enters us through its deinit. Other connections stay live.
+    const owned = self.app.tmux.take(session.attach).?;
     owned.closeFollowers();
     owned.deinit();
+    self.app.alloc.destroy(owned);
     log.info("tmux control mode exited", .{});
 
     // The gateway is a shell again. Replace the control plate title with
@@ -5615,7 +5612,7 @@ pub fn tmuxTeardown(self: *Surface) void {
 fn tmuxOnDeinit(self: *Surface) void {
     if (comptime !terminal.options.tmux_control_mode) return;
 
-    const session = if (self.app.tmux) |*s| s else return;
+    const session = self.tmuxSession() orelse return;
     if (session.isLeader(self)) {
         self.tmuxTeardown();
         return;

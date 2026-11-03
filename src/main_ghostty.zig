@@ -243,6 +243,7 @@ test {
     _ = @import("surface_mouse.zig");
     _ = @import("tmux_action.zig");
     _ = @import("tmux_mirror.zig");
+    _ = @import("TmuxSession.zig");
 
     // Libraries
     _ = @import("tripwire.zig");
