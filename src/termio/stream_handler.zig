@@ -527,7 +527,23 @@ pub const StreamHandler = struct {
                 // read up front, and the loop ends when the viewer did.
                 const actions = viewer.next(.{ .tmux = tmux });
                 const session_id = viewer.session_id;
+
+                // The viewer already counts every command in this batch
+                // as in flight. Publish all their bytes before ANY mailbox
+                // write can release the mutex and let newer IO-thread input
+                // join the pipeline, even when .windows comes first.
+                const notify = self.tmuxStageCommands(actions) catch |err| {
+                    log.warn("failed to stage tmux commands err={}", .{err});
+                    self.tmuxAbort();
+                    break :tmux;
+                };
+                if (notify) {
+                    self.messageWriter(.tmux_write);
+                    if (self.tmux_viewer != viewer) break :tmux;
+                }
+
                 for (actions) |action| {
+                    if (action == .command) continue;
                     log.info("tmux viewer action={f}", .{action});
                     // The viewer never sees %exit (that is handled above),
                     // so this means it gave up on its own. Tearing it down
@@ -590,7 +606,28 @@ pub const StreamHandler = struct {
         "  L    Toggle logging.\r\n" ++
         "  C    Run tmux command.\r\n";
 
-    /// Carry out a viewer action. `session_id` is the viewer's: the viewer
+    /// Publish a whole reader batch while the renderer mutex is held.
+    /// This must not send messages: either mailbox can release the lock.
+    /// Returns whether the IO thread needs a pending-write wakeup.
+    fn tmuxStageCommands(
+        self: *StreamHandler,
+        actions: []const terminal.tmux.Viewer.Action,
+    ) Allocator.Error!bool {
+        const was_empty = self.tmux_writes.items.len == 0;
+        for (actions) |action| switch (action) {
+            .command => |command| {
+                assert(command.len > 0);
+                assert(command[command.len - 1] == '\n');
+                if (self.tmux_logging.load(.acquire)) self.tmuxLogOut(command);
+                try self.tmux_writes.appendSlice(self.alloc, command);
+            },
+            else => {},
+        };
+        return was_empty and self.tmux_writes.items.len > 0;
+    }
+
+    /// Carry out a non-command action. Commands must already be staged
+    /// or returned to the IO thread. `session_id` is the viewer's: the viewer
     /// may be gone by the time this sends the action on.
     fn tmuxAction(
         self: *StreamHandler,
@@ -603,14 +640,7 @@ pub const StreamHandler = struct {
                 // before freeing the viewer.
             },
 
-            .command => |command| {
-                assert(command.len > 0);
-                assert(command[command.len - 1] == '\n');
-                if (self.tmux_logging.load(.acquire)) self.tmuxLogOut(command);
-                const notify = self.tmux_writes.items.len == 0;
-                try self.tmux_writes.appendSlice(self.alloc, command);
-                if (notify) self.messageWriter(.tmux_write);
-            },
+            .command => unreachable,
 
             .pane_restore => |v| self.tmuxForwardRestore(v),
 
@@ -777,6 +807,8 @@ pub const StreamHandler = struct {
     /// sends until it leaves control mode is drained quietly.
     fn tmuxAbort(self: *StreamHandler) void {
         log.warn("tmux control mode failed, detaching", .{});
+        // A failed batch must not be overtaken while queuing detach.
+        self.tmuxDetaching();
         if (self.alloc.dupe(u8, "detach-client\n")) |data| {
             self.messageWriter(.{ .tmux_raw = .{
                 .alloc = self.alloc,
@@ -2411,6 +2443,146 @@ fn osc7Host(
     return component.toRaw(buffer) catch |err| switch (err) {
         error.NoSpaceLeft => error.NameTooLong,
     };
+}
+
+test "tmux publishes input before a full surface mailbox releases the mutex" {
+    try testTmuxCommandPublication(false);
+}
+
+test "tmux publishes input before a full IO mailbox releases the mutex" {
+    try testTmuxCommandPublication(true);
+}
+
+fn testTmuxCommandPublication(full_io: bool) !void {
+    if (comptime !StreamHandler.tmux_enabled or
+        build_config.artifact != .exe or build_config.app_runtime != .gtk)
+        return error.SkipZigTest;
+
+    const testing = std.testing;
+    const CoreApp = @import("../App.zig");
+    const NativeApplication = @import("../apprt/gtk/class/application.zig").Application;
+    var viewer = try terminal.tmux.Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+    viewer.mirror_panes = false;
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .client = false } } });
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{ .id = 0, .name = "0" } } });
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .data = "3.6" } } });
+    // list-windows is in flight; its reply will release these two inputs
+    // in an action batch whose .windows precedes its .command.
+    try testing.expectEqual(0, viewer.sendInput(0, "a").len);
+    try testing.expectEqual(0, viewer.sendInput(0, "b").len);
+
+    const app_queue = try CoreApp.Mailbox.Queue.create(testing.allocator);
+    defer app_queue.destroy(testing.allocator);
+    defer while (app_queue.pop(testing.io)) |msg| {
+        if (msg == .surface_message and msg.surface_message.message == .tmux_windows)
+            msg.surface_message.message.tmux_windows.destroy();
+    };
+    while (app_queue.push(testing.io, .quit, .{ .instant = {} }) > 0) {}
+
+    var io_mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer io_mailbox.deinit(testing.allocator);
+    if (full_io) while (io_mailbox.spsc.queue.push(
+        testing.io,
+        .{ .write_stable = "" },
+        .{ .instant = {} },
+    ) > 0) {};
+
+    // GTK's wakeup only wakes the default GLib context; it does not read
+    // application or surface state. No windows are needed for this test.
+    var native_app: NativeApplication = undefined;
+    var rt_app: apprt.App = .{ .app = &native_app };
+    var surface: @import("../Surface.zig") = undefined;
+    var mutex: std.Io.Mutex = .init;
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.tmux_viewer = &viewer;
+    handler.tmux_logging = .init(false);
+    handler.tmux_writes = .empty;
+    defer handler.tmux_writes.deinit(testing.allocator);
+    handler.tmux_follower = false;
+    handler.termio_messaged = false;
+    handler.termio_mailbox = &io_mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.surface_mailbox = .{
+        .surface = &surface,
+        .app = .{ .rt_app = &rt_app, .mailbox = app_queue },
+    };
+
+    const Writer = struct {
+        handler: *StreamHandler,
+        app_queue: *CoreApp.Mailbox.Queue,
+        full_io: bool,
+        wire: std.ArrayList(u8) = .empty,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            // The reader owns this mutex until a full mailbox makes it
+            // yield. Simulate the IO thread flushing older bytes before
+            // submitting the next input, as Termio.tmuxSendKeys does.
+            self.handler.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.handler.renderer_state.mutex.unlock(global.io());
+            defer {
+                _ = self.app_queue.pop(global.io());
+                if (self.full_io) _ = self.handler.termio_mailbox.spsc.queue.pop(global.io());
+            }
+            self.write() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn write(self: *@This()) !void {
+            try self.wire.appendSlice(std.testing.allocator, self.handler.tmux_writes.items);
+            self.handler.tmux_writes.clearRetainingCapacity();
+            const newer = self.handler.tmuxSubmitCommand(.{
+                .input = .{ .pane_id = 0, .data = "c" },
+            }) orelse return error.TestUnexpectedResult;
+            try self.wire.appendSlice(std.testing.allocator, newer);
+        }
+    };
+    var writer: Writer = .{ .handler = &handler, .app_queue = app_queue, .full_io = full_io };
+    defer writer.wire.deinit(testing.allocator);
+
+    mutex.lockUncancelable(testing.io);
+    const thread = std.Thread.spawn(.{}, Writer.run, .{&writer}) catch |err| {
+        mutex.unlock(testing.io);
+        return err;
+    };
+    var reply: terminal.dcs.Command = .{ .tmux = .{ .block_end = .{
+        .data = "$0\t@0\t0\t1\t0\t%0\t80\t24\tb25d,80x24,0,0,0\tb25d,80x24,0,0,0\tA\tshell",
+    } } };
+    const result = handler.dcsCommand(&reply);
+    mutex.unlock(testing.io);
+    thread.join();
+    try result;
+    if (writer.err) |err| return err;
+    try writer.wire.appendSlice(testing.allocator, handler.tmux_writes.items);
+
+    try testing.expectEqualStrings(
+        "send-keys -t %0 -H 0x61\ndisplay-message -p 'ghostty-command-end 0'\n" ++
+            "send-keys -t %0 -H 0x62\ndisplay-message -p 'ghostty-command-end 1'\n" ++
+            "send-keys -t %0 -H 0x63\ndisplay-message -p 'ghostty-command-end 2'\n",
+        writer.wire.items,
+    );
+    try testing.expectEqual(3, viewer.command_in_flight);
+
+    // Replies in wire order must release a subsequent barrier, rather
+    // than leave it waiting on an input marker that already arrived.
+    try testing.expectEqual(0, viewer.sendCommand("display-message -p after\n").len);
+    for (0..3) |id| {
+        var buf: [64]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&buf, "ghostty-command-end {d}", .{id});
+        const actions = viewer.next(.{ .tmux = .{ .block_end = .{ .data = marker } } });
+        if (id < 2) {
+            try testing.expectEqual(0, actions.len);
+        } else {
+            try testing.expectEqual(1, actions.len);
+            try testing.expect(std.mem.startsWith(u8, actions[0].command, "display-message -p after\n"));
+        }
+    }
+    _ = viewer.next(.{ .tmux = .{ .block_end = .{ .data = "ghostty-command-end 3" } } });
+    try testing.expect(viewer.command_queue.empty());
 }
 
 test "osc7Host accepts hostnames that are not RFC 1123" {
